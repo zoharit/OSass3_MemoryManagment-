@@ -1,0 +1,1724 @@
+diff --git a/Makefile b/Makefile
+old mode 100644
+new mode 100755
+index 06eea5d..b1894d5
+--- a/Makefile
++++ b/Makefile
+@@ -27,6 +27,7 @@ OBJS = \
+ 	uart.o\
+ 	vectors.o\
+ 	vm.o\
++	
+ 
+ # Cross-compiling (e.g., on Mac OS X)
+ # TOOLPREFIX = i386-jos-elf
+@@ -71,6 +72,14 @@ QEMU = $(shell if which qemu > /dev/null; \
+ 	echo "***" 1>&2; exit 1)
+ endif
+ 
++ifndef SELECTION
++	SELECTION = SCFIFO
++endif
++
++ifndef VERBOSE_PRINT
++	VERBOSE_PRINT= FALSE
++endif
++
+ CC = $(TOOLPREFIX)gcc
+ AS = $(TOOLPREFIX)gas
+ LD = $(TOOLPREFIX)ld
+@@ -79,6 +88,7 @@ OBJDUMP = $(TOOLPREFIX)objdump
+ CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
+ #CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -fvar-tracking -fvar-tracking-assignments -O0 -g -Wall -MD -gdwarf-2 -m32 -Werror -fno-omit-frame-pointer
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
++CFLAGS += -D$(SELECTION) -D$(VERBOSE_PRINT)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+ LDFLAGS += -m $(shell $(LD) -V | grep elf_i386 2>/dev/null | head -n 1)
+@@ -174,6 +184,7 @@ UPROGS=\
+ 	_usertests\
+ 	_wc\
+ 	_zombie\
++	_myMemTest\
+ 
+ fs.img: mkfs README $(UPROGS)
+ 	./mkfs fs.img README $(UPROGS)
+diff --git a/defs.h b/defs.h
+index 7ad2380..eb204ba 100644
+--- a/defs.h
++++ b/defs.h
+@@ -193,6 +193,28 @@ void            switchuvm(struct proc*);
+ void            switchkvm(void);
+ int             copyout(pde_t*, uint, void*, uint);
+ void            clearpteu(pde_t *pgdir, char *uva);
+-
++void            move_File2Pyc(struct proc*,uint);
++void            move_Pyc2File(struct proc*);
++void            make_full_swap(struct proc*, uint);
++void            copy_pyc_pages(struct proc*,struct proc*);
++void            copy_file_pages(struct proc*,struct proc*);
++void            free_pyc_pages(struct proc*);
++void            free_file_pages(struct proc*);
++void			delete_file_page(struct proc*, uint);
++void			delete_pyc_page(struct proc*, uint);
++int             alloc_pages(pde_t *,uint,uint);
++char*           insert_to_mem(struct proc*,pde_t *,uint);
++void            print_count_free_pages();
++struct page_data findPageToSwap(struct proc* p);
+ // number of elements in fixed-size array
++struct page_data SCFIFO_ALG(struct proc* p);
++
++struct page_data LIFO_ALG(struct proc* p);
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
++
++int             protected_page(void*);
++int             is_protected(void*);
++int             is_pmalloc(void*);
++void            update_unprotected(void* va);
++void            Update_Pmalloc(void*);
++void            pmalloc_Off(void*);
+diff --git a/exec.c b/exec.c
+index b40134f..2ff9d5e 100644
+--- a/exec.c
++++ b/exec.c
+@@ -18,7 +18,11 @@ exec(char *path, char **argv)
+   struct proghdr ph;
+   pde_t *pgdir, *oldpgdir;
+   struct proc *curproc = myproc();
+-
++  #ifndef NONE
++  uint pages_num_mem = 0;
++  uint pages_num_files = 0;
++  uint backup_count_pages_faults=0;
++#endif
+   begin_op();
+ 
+   if((ip = namei(path)) == 0){
+@@ -38,6 +42,22 @@ exec(char *path, char **argv)
+   if((pgdir = setupkvm()) == 0)
+     goto bad;
+ 
++  #ifndef NONE
++  pages_num_mem = curproc->count_physical_pages;
++pages_num_files=curproc->count_file_pages;
++backup_count_pages_faults=curproc->count_pages_faults;
++  // the number of pages in the physical memory = 0;
++  curproc->count_physical_pages = 0;
++  // save all the physical memory pages
++  struct page_data memory_pages_container[MAX_PSYC_PAGES];
++  for (i = 0; i < MAX_PSYC_PAGES; i++) {
++    //copy to the container
++    memory_pages_container[i].va = 
++    curproc->physical_memory_pages[i].va;
++    //clean the physical memory
++    curproc->physical_memory_pages[i].va = -1;
++  }
++#endif
+   // Load program into memory.
+   sz = 0;
+   for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
+@@ -56,6 +76,8 @@ exec(char *path, char **argv)
+     if(loaduvm(pgdir, (char*)ph.vaddr, ip, ph.off, ph.filesz) < 0)
+       goto bad;
+   }
++
++
+   iunlockput(ip);
+   end_op();
+   ip = 0;
+@@ -99,8 +121,17 @@ exec(char *path, char **argv)
+   curproc->sz = sz;
+   curproc->tf->eip = elf.entry;  // main
+   curproc->tf->esp = sp;
++
++  //why??
++
++  #ifndef NONE
++  removeSwapFile(curproc);
++  createSwapFile(curproc);
++#endif
++
+   switchuvm(curproc);
+   freevm(oldpgdir);
++  
+   return 0;
+ 
+  bad:
+@@ -110,5 +141,16 @@ exec(char *path, char **argv)
+     iunlockput(ip);
+     end_op();
+   }
++#ifndef NONE
++   // exec failed-restore the process data
++    curproc->count_physical_pages = pages_num_mem;
++    curproc->count_file_pages=pages_num_files;
++    curproc->count_pages_faults=backup_count_pages_faults;
++    for (i = 0; i < MAX_PSYC_PAGES; i++) {
++      curproc->physical_memory_pages[i].va = 
++      memory_pages_container[i].va;
++    }  
++
++    #endif
+   return -1;
+ }
+diff --git a/fs.c b/fs.c
+index 3cb3f8e..a1b32e0 100644
+--- a/fs.c
++++ b/fs.c
+@@ -801,6 +801,7 @@ writeToSwapFile(struct proc * p, char* buffer, uint placeOnFile, uint size)
+ }
+ 
+ //return as sys_read (-1 when error)
++// chamge the offset to be the place in the files tbl
+ int
+ readFromSwapFile(struct proc * p, char* buffer, uint placeOnFile, uint size)
+ {
+diff --git a/kalloc.c b/kalloc.c
+index 14cd4f4..792061b 100644
+--- a/kalloc.c
++++ b/kalloc.c
+@@ -12,7 +12,8 @@
+ void freerange(void *vstart, void *vend);
+ extern char end[]; // first address after kernel loaded from ELF file
+                    // defined by the kernel linker script in kernel.ld
+-
++int free_pages=0;
++int total_available_pages=0;
+ struct run {
+   struct run *next;
+ };
+@@ -23,6 +24,12 @@ struct {
+   struct run *freelist;
+ } kmem;
+ 
++
++int getTotalPageskernel(){
++  return PGROUNDDOWN(PHYSTOP-V2P(end))/PGSIZE;
++}
++
++
+ // Initialization happens in two phases.
+ // 1. main() calls kinit1() while still using entrypgdir to place just
+ // the pages mapped by entrypgdir on free list.
+@@ -34,12 +41,14 @@ kinit1(void *vstart, void *vend)
+   initlock(&kmem.lock, "kmem");
+   kmem.use_lock = 0;
+   freerange(vstart, vend);
++  total_available_pages+=(PGROUNDDOWN((uint)vend) - PGROUNDUP((uint)vstart))/PGSIZE;
+ }
+ 
+ void
+ kinit2(void *vstart, void *vend)
+ {
+   freerange(vstart, vend);
++  total_available_pages+=(PGROUNDDOWN((uint)vend) - PGROUNDUP((uint)vstart))/PGSIZE;
+   kmem.use_lock = 1;
+ }
+ 
+@@ -61,6 +70,7 @@ kfree(char *v)
+ {
+   struct run *r;
+ 
++free_pages++;
+   if((uint)v % PGSIZE || v < end || V2P(v) >= PHYSTOP)
+     panic("kfree");
+ 
+@@ -82,8 +92,8 @@ kfree(char *v)
+ char*
+ kalloc(void)
+ {
++  free_pages--;
+   struct run *r;
+-
+   if(kmem.use_lock)
+     acquire(&kmem.lock);
+   r = kmem.freelist;
+@@ -94,3 +104,7 @@ kalloc(void)
+   return (char*)r;
+ }
+ 
++void print_count_free_pages(){
++  cprintf("%d / %d free pages in the system\n", free_pages,total_available_pages); 
++}
++
+diff --git a/mmu.h b/mmu.h
+index 7b63db0..69b020d 100644
+--- a/mmu.h
++++ b/mmu.h
+@@ -141,6 +141,9 @@ struct segdesc {
+ #define PTE_D           0x040   // Dirty
+ #define PTE_PS          0x080   // Page Size
+ #define PTE_MBZ         0x180   // Bits must be zero
++#define PTE_PG          0x200   // Paged out to secondary storage 
++//#define PTE_PROT        0x400   // PROTECTED PAGE 
++#define PTE_PMAL        0x400   // PMALLOC 
+ 
+ // Address in page table or page directory entry
+ #define PTE_ADDR(pte)   ((uint)(pte) & ~0xFFF)
+diff --git a/myMemTest.c b/myMemTest.c
+new file mode 100644
+index 0000000..50f94db
+--- /dev/null
++++ b/myMemTest.c
+@@ -0,0 +1,236 @@
++#include "types.h"
++#include "stat.h"
++#include "user.h"
++#include "syscall.h"
++#include "types.h"
++#include "user.h"
++#include "syscall.h"
++
++#define PGSIZE 4096
++
++
++int
++main(int argc, char *argv[])
++{
++	#if TASKONE
++printf(1, "**********************************TASK 1**********************************\n");
++
++//pmalloc test 
++printf(1, "Start alocate pages with pmalloc/malloc...");
++int n = 6;
++char *parray[n];
++int protarray[n];
++for (int k = 0; k < n; ++k) {
++ if(k%2==0)
++ {
++     parray[k]=pmalloc();
++ }
++ else {
++     parray[k]=malloc(k*1000);
++ }
++}
++
++printf(1, "malloc/pmalloc success! %d\n", (int)parray[0]);
++printf(1, "protecting pages\n");
++
++for (int k = 0; k < n; ++k) {
++   protarray[k]=protect_page(parray[k]);
++}
++
++printf(1, "protecting pages successfully\n");
++printf(1, "validating pages ..\n");
++
++
++for (int k = 0; k < n; ++k) {
++   if(k%2==0){
++   if (protarray[k]){
++       printf(1, "index %d valid!\n",k);
++   }
++   else{
++       printf(1, "index %d not valid!\n",k);
++
++   }
++   }
++   else {
++        if (protarray[k]==-1){
++             printf(1, "index %d valid!\n",k);
++        }
++        else{
++            printf(1, "index %d not valid!\n",k);
++
++        }
++   
++   }
++   
++}
++int pid=fork();
++if(pid==0){
++	printf(1, "We access protected page TRAP 13 should appeare:\n");
++	parray[0][1]='z';
++}
++else{
++
++wait();
++
++printf(1, "validating ended successfully\n");
++printf(1, "free pages..\n");
++
++
++for (int k = 0; k < n; ++k) {
++    if(k%2==0){
++   pfree(parray[k]);
++    }
++    else{
++    free(parray[k]);
++
++    }
++}
++
++printf(1, "free pages ended successfully..\n");
++	printf(1, "**********************************END TASK 1**********************************\n");
++}
++
++    #elif SCFIFO
++    int i;
++	//create page array
++	char *arr[31];
++	char input[10];
++	printf(1, "**********************************FIFO**********************************\n");
++	gets(input, 10);
++	//create 13 pages because there are allready 3 that  create in the comp time 
++	for (i = 0; i < 13; ++i) {
++		arr[i] = sbrk(PGSIZE);
++		printf(1, "added page %d\n",i+4);
++	}
++	printf(1, "\n\ncheck that RAM is full (16 pages) \n\n");
++	gets(input, 5);
++
++	printf(1, "\ncreating 4 pages and 1 protected page... \n");
++	arr[13] = sbrk(PGSIZE);
++	arr[14] = sbrk(PGSIZE);
++	arr[15] = sbrk(PGSIZE);
++	arr[16] = sbrk(PGSIZE);
++	arr[17] = pmalloc();
++	protect_page(arr[17]);
++	//page 1 is kernel ,pages 0,2 have been accessed
++	printf(1, "\n\ncheck that pages 3,4,5,6,7 are taken out in a fifo matter\n\n");
++	gets(input, 10);
++
++	printf(1, "\n\n We accessed pages 9,11 \n\n");
++
++	//access to page 9
++	arr[6][1]='o';
++	//access to page 11
++	arr[8][1]='r';
++
++	printf(1, "we try to access pages 3,4,5,6 so now we will get page fault and pages 8,10,12,13 will be swapped: \n\n");
++
++
++	arr[0][1] = 'z';
++	arr[1][1] = 'o';
++	arr[2][1] = 'h';
++	arr[3][1] = 'a';
++
++	gets(input, 10);
++	
++	printf(1,"\n\nforking, please wait...\n\n");
++
++	if (fork() == 0) {
++		printf(1, "\ncreated a child process %d\n",getpid());
++		printf(1, "check: child pages should be identical to father\n");
++		gets(input, 10);
++
++		printf(1, "\n\n try to access page 7 ,but it is in the DISC so now we will get page fault in child process Should swap page 14 \n\n");
++		arr[4][1] = 'x';
++		gets(input, 10);
++		exit();
++	}
++	else {
++		wait();
++		printf(1, "\n\nfree the protect page\n\n");
++		pfree(arr[17]);
++		sbrk(-16 * PGSIZE);
++		printf(1, "\n\ncheck: father has only 5 pages after deallocation\n\n");
++		gets(input, 10);
++    	printf(1, "END OF TEST\n");
++
++	}
++
++
++    #elif LIFO
++    int i;
++	char *arr[31];
++	char input[10];
++	printf(1, "**********************************LIFO**********************************\n");
++	gets(input, 10);
++
++	for (i = 0; i < 13; ++i) {
++		arr[i] = sbrk(PGSIZE);
++		printf(1, "added page %d\n",i+4);
++	}
++    
++	printf(1, "\n\ncheck that RAM space is full \n\n");
++	gets(input, 5);
++
++	printf(1, "\ncreating 3 pages and 2 protected pages... \n");
++	arr[13] = sbrk(PGSIZE);
++	arr[14] = sbrk(PGSIZE);
++	arr[15] = sbrk(PGSIZE);
++		
++	arr[16] = pmalloc();
++	protect_page(arr[16]);
++
++	arr[17] = pmalloc();
++	protect_page(arr[17]);
++	printf(1, "\n\ncheck that pages 15,14,13,12,11 are taken out in a Lifo matter\n\n");
++	gets(input, 10);
++	
++	printf(1, "\n\nWe accessed pages 15,14 -the 2 pages we just moved to DISK. check for 2 page faults : ");
++	printf(1, "pages 10,9 should be swpped\n\n");
++	//accessing to pages 15,14
++	int j;
++	for (j=12; j>10; j--){ 
++		arr[j][1]='Z';
++	}
++
++	gets(input, 10);
++	
++	printf(1,"\n\nforking, please wait...\n\n");
++
++	if (fork() == 0) {
++	
++		printf(1, "\ncreated a child process %d\n",getpid());
++		printf(1, "check: child pages should be identical to father\n");
++		gets(input, 10);
++		printf(1, "\n\ncheck: 1 page fault in child process (accessed page  which was just moved to DISK) - Should swap page 10 \n\n");
++		arr[10][0] = 'x';
++		gets(input, 10);
++		exit();
++	}
++	else {
++		wait();
++		printf(1, "\n\nfree the protect pages\n\n");
++
++		pfree(arr[16]);
++		pfree(arr[17]);
++
++		sbrk(-16 * PGSIZE);
++		printf(1, "\n\ncheck: father has only 5 pages after deallocation\n\n");
++		gets(input, 10);
++    	printf(1, "END OF TEST\n");
++
++	}
++
++	#else //NONE
++    char* pagesArr[50];
++    int i = 50;
++    printf(1, "None: no page faults should occur\n");
++    for (i = 0; i < 50; i++) {
++        pagesArr[i] = sbrk(PGSIZE);
++        printf(1, "pagesArr[%d]=0x%x\n", i, pagesArr[i]);
++    }
++    printf(1, "TEST IS DONE\n");
++	#endif
++    exit();
++}
++
+diff --git a/proc.c b/proc.c
+index 806b1b1..03ab4a0 100644
+--- a/proc.c
++++ b/proc.c
+@@ -17,7 +17,6 @@ static struct proc *initproc;
+ int nextpid = 1;
+ extern void forkret(void);
+ extern void trapret(void);
+-
+ static void wakeup1(void *chan);
+ 
+ void
+@@ -111,10 +110,25 @@ found:
+   p->context = (struct context*)sp;
+   memset(p->context, 0, sizeof *p->context);
+   p->context->eip = (uint)forkret;
+-
++  p->count_physical_pages = 0;
++  p->count_pages_faults=0;
++  p->count_file_pages = 0;
++  p->LIFO_INDEX = 15;
++  p->FIFO_INDEX = 0;
++  p->count_total_swap=0;
++  p->count_protected_pages=0;
++  #ifndef NONE
++    int i;
++  for (i = 0; i < MAX_PSYC_PAGES; i++) {
++    p->file_pages[i] = -1;
++  } 
++    free_pyc_pages(p);
++#endif
+   return p;
+ }
+ 
++
++
+ //PAGEBREAK: 32
+ // Set up first user process.
+ void
+@@ -174,6 +188,8 @@ growproc(int n)
+   return 0;
+ }
+ 
++
++
+ // Create a new process copying p as the parent.
+ // Sets up stack to return as if from system call.
+ // Caller must set state of returned proc to RUNNABLE.
+@@ -184,11 +200,12 @@ fork(void)
+   struct proc *np;
+   struct proc *curproc = myproc();
+ 
++
+   // Allocate process.
+   if((np = allocproc()) == 0){
+     return -1;
+   }
+-
++  
+   // Copy process state from proc.
+   if((np->pgdir = copyuvm(curproc->pgdir, curproc->sz)) == 0){
+     kfree(np->kstack);
+@@ -196,6 +213,7 @@ fork(void)
+     np->state = UNUSED;
+     return -1;
+   }
++
+   np->sz = curproc->sz;
+   np->parent = curproc;
+   *np->tf = *curproc->tf;
+@@ -211,7 +229,19 @@ fork(void)
+   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
+ 
+   pid = np->pid;
+-
++  #ifndef NONE
++   //copy all the physical pages from father to child
++  copy_pyc_pages(curproc,np);
++  np->count_protected_pages=curproc->count_protected_pages;
++  // check that its not the shell and not initproc-
++  // create a swap file and copy them from father to child
++  if(curproc->pid > 1) {
++    // creat the child's file
++    createSwapFile(np);
++    // copy file pages from father to child
++    copy_file_pages(curproc,np);  
++  }
++  #endif
+   acquire(&ptable.lock);
+ 
+   np->state = RUNNABLE;
+@@ -241,6 +271,11 @@ exit(void)
+       curproc->ofile[fd] = 0;
+     }
+   }
++  #ifndef NONE
++
++  free_pyc_pages(curproc);
++  free_file_pages(curproc);
++  #endif
+ 
+   begin_op();
+   iput(curproc->cwd);
+@@ -267,6 +302,7 @@ exit(void)
+   panic("zombie exit");
+ }
+ 
++
+ // Wait for a child process to exit and return its pid.
+ // Return -1 if this process has no children.
+ int
+@@ -290,16 +326,24 @@ wait(void)
+         kfree(p->kstack);
+         p->kstack = 0;
+         freevm(p->pgdir);
+-        p->pid = 0;
+         p->parent = 0;
+         p->name[0] = 0;
+         p->killed = 0;
+         p->state = UNUSED;
+         release(&ptable.lock);
++
++
++        #ifndef NONE
++        free_pyc_pages(p);
++        for(int j = 0; j < MAX_FILES_PAGES ; j++) {
++          p->file_pages[j] = -1;
++        }
++        p->count_file_pages = 0;
++        #endif
++        p->pid = 0;
+         return pid;
+       }
+     }
+-
+     // No point waiting if we don't have any children.
+     if(!havekids || curproc->killed){
+       release(&ptable.lock);
+@@ -311,6 +355,7 @@ wait(void)
+   }
+ }
+ 
++
+ //PAGEBREAK: 42
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+@@ -355,6 +400,7 @@ scheduler(void)
+   }
+ }
+ 
++
+ // Enter scheduler.  Must hold only ptable.lock
+ // and have changed proc->state. Saves and restores
+ // intena because intena is a property of this
+@@ -390,7 +436,6 @@ yield(void)
+   sched();
+   release(&ptable.lock);
+ }
+-
+ // A fork child's very first scheduling by scheduler()
+ // will swtch here.  "Return" to user space.
+ void
+@@ -523,12 +568,15 @@ procdump(void)
+       state = states[p->state];
+     else
+       state = "???";
+-    cprintf("%d %s %s", p->pid, state, p->name);
++    cprintf("id:%d, status:%s, total_pages:%d, file_pages:%d, protected:%d,page_fault:%d, swap:%d, proc:%s"
++            ,p->pid, state,p->count_physical_pages+p->count_file_pages,p->count_file_pages,
++            p->count_protected_pages,p->count_pages_faults,p->count_total_swap,p->name);
+     if(p->state == SLEEPING){
+       getcallerpcs((uint*)p->context->ebp+2, pc);
+       for(i=0; i<10 && pc[i] != 0; i++)
+         cprintf(" %p", pc[i]);
+     }
+     cprintf("\n");
++    print_count_free_pages();
+   }
+ }
+diff --git a/proc.h b/proc.h
+index bd4f91d..f477e68 100644
+--- a/proc.h
++++ b/proc.h
+@@ -1,3 +1,6 @@
++#define MAX_TOTAL_PAGES 32
++#define MAX_PSYC_PAGES 16
++#define MAX_FILES_PAGES 16
+ // Per-CPU state
+ struct cpu {
+   uchar apicid;                // Local APIC ID
+@@ -32,30 +35,37 @@ struct context {
+   uint eip;
+ };
+ 
++struct page_data{
++  int va;                        //virtual address
++};
+ enum procstate { UNUSED, EMBRYO, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
+ // Per-process state
+ struct proc {
+-  uint sz;                     // Size of process memory (bytes)
+-  pde_t* pgdir;                // Page table
+-  char *kstack;                // Bottom of kernel stack for this process
+-  enum procstate state;        // Process state
+-  int pid;                     // Process ID
+-  struct proc *parent;         // Parent process
+-  struct trapframe *tf;        // Trap frame for current syscall
+-  struct context *context;     // swtch() here to run process
+-  void *chan;                  // If non-zero, sleeping on chan
+-  int killed;                  // If non-zero, have been killed
+-  struct file *ofile[NOFILE];  // Open files
+-  struct inode *cwd;           // Current directory
+-  char name[16];               // Process name (debugging)
++  uint sz;                          // Size of process memory (bytes)
++  pde_t* pgdir;                     // Page table
++  char *kstack;                     // Bottom of kernel stack for this process
++  enum procstate state;             // Process state
++  int pid;                          // Process ID
++  struct proc *parent;              // Parent process
++  struct trapframe *tf;             // Trap frame for current syscall
++  struct context *context;          // swtch() here to run process
++  void *chan;                       // If non-zero, sleeping on chan
++  int killed;                       // If non-zero, have been killed
++  struct file *ofile[NOFILE];       // Open files
++  struct inode *cwd;                // Current directory
++  char name[16];                    // Process name (debugging)
+ 
+   //Swap file. must initiate with create swap file
+-  struct file *swapFile;      //page file
++  struct file *swapFile;            // page file
++  struct page_data physical_memory_pages[MAX_PSYC_PAGES]; //physical pages 
++  int file_pages[MAX_PSYC_PAGES];                         //file pages
++  uint count_physical_pages;                              //number of pages in physical memory
++  uint count_file_pages;    
++  int count_pages_faults;                                 //number of pages fault
++  int FIFO_INDEX;                                      
++  int LIFO_INDEX;  
++  int count_total_swap;                                   //the total numbers if times when we move page from physical to file
++  int count_protected_pages;                              //number of all protected pages
+ };
+ 
+-// Process memory is laid out contiguously, low addresses first:
+-//   text
+-//   original data and bss
+-//   fixed-size stack
+-//   expandable heap
+diff --git a/syscall.c b/syscall.c
+old mode 100644
+new mode 100755
+index f447101..a9623d8
+--- a/syscall.c
++++ b/syscall.c
+@@ -104,6 +104,13 @@ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
+ extern int sys_yield(void);
++extern int sys_protected_page(void);
++extern int sys_is_protected(void);
++extern int sys_Update_Pmalloc(void);
++extern int sys_is_pmalloc(void);
++extern int sys_update_unprotected(void);
++extern int sys_pmalloc_Off(void);
++
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -128,8 +135,15 @@ static int (*syscalls[])(void) = {
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
+ [SYS_yield]   sys_yield,
++[SYS_protected_page]   sys_protected_page,
++[SYS_is_protected]   sys_is_protected,
++[SYS_Update_Pmalloc] sys_Update_Pmalloc,
++[SYS_is_pmalloc]   sys_is_pmalloc,
++[SYS_update_unprotected]   sys_update_unprotected,
++[SYS_pmalloc_Off]   sys_pmalloc_Off,
+ };
+ 
++
+ void
+ syscall(void)
+ {
+diff --git a/syscall.h b/syscall.h
+old mode 100644
+new mode 100755
+index 73b388e..63de3d0
+--- a/syscall.h
++++ b/syscall.h
+@@ -21,3 +21,11 @@
+ #define SYS_mkdir  20
+ #define SYS_close  21
+ #define SYS_yield  22
++#define SYS_protected_page  23
++#define SYS_is_protected  24
++#define SYS_Update_Pmalloc 25
++#define SYS_is_pmalloc  26
++#define SYS_update_unprotected 27
++#define SYS_pmalloc_Off 28
++
++
+diff --git a/sysfile.c b/sysfile.c
+old mode 100644
+new mode 100755
+diff --git a/sysproc.c b/sysproc.c
+old mode 100644
+new mode 100755
+index 2014f12..65ec9a2
+--- a/sysproc.c
++++ b/sysproc.c
+@@ -96,3 +96,45 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++int sys_protected_page(void){
++  void* va;
++  if(argptr(0, (void*)&va,4) < 0)
++    return -1;
++  return protected_page(va);
++}
++
++int sys_is_protected(void){
++  void* va;
++  if(argptr(0, (void*)&va,4) < 0)
++    return -1;
++  return is_protected(va);
++}
++int sys_is_pmalloc(void){
++  void* va;
++  if(argptr(0, (void*)&va,4) < 0)
++    return -1;
++  return is_pmalloc(va);
++}
++int sys_update_unprotected(void){
++  void* va;
++  if(argptr(0, (void*)&va,4) < 0)
++    return -1;
++   update_unprotected(va);
++   return 1;
++}
++int sys_pmalloc_Off(void){
++   void* va;
++  if(argptr(0, (void*)&va,4) < 0)
++    return -1;
++  pmalloc_Off(va);
++return 1;
++}
++
++
++int sys_Update_Pmalloc(void){
++  void* va;
++  if(argptr(0, (void*)&va,4) < 0)
++    return -1;
++   Update_Pmalloc(va);
++   return 1;
++}
+\ No newline at end of file
+diff --git a/trap.c b/trap.c
+index 41c66eb..10493e4 100644
+--- a/trap.c
++++ b/trap.c
+@@ -11,6 +11,7 @@
+ // Interrupt descriptor table (shared by all CPUs).
+ struct gatedesc idt[256];
+ extern uint vectors[];  // in vectors.S: array of 256 entry pointers
++extern int pageSwapped(struct proc*,uint);
+ struct spinlock tickslock;
+ uint ticks;
+ 
+@@ -77,6 +78,45 @@ trap(struct trapframe *tf)
+             cpuid(), tf->cs, tf->eip);
+     lapiceoi();
+     break;
++ 
++    case T_PGFLT:
++    {
++    struct proc* curr_proc = myproc();
++    //check that the proc is not shell/init
++
++    if (curr_proc != 0 && curr_proc->pid > 2 && (tf->cs&3) == DPL_USER ) {
++    if (is_protected((void*)rcr2())) {
++      tf->trapno=T_GPFLT;
++      tf->eax=T_GPFLT;
++          }
++      uint cr2Val = rcr2();
++      //get page dir table entry (first table)
++      pde_t* pde_t = &curr_proc->pgdir[PDX(cr2Val)];
++      uint pde = (uint)(*pde_t);
++      if((pde & PTE_P) != 0){
++    if (pageSwapped(curr_proc,cr2Val)) {
++        cprintf("page fault \n");
++          curr_proc->count_pages_faults++;
++          // check if we need to make room for this page in the physical memory
++          if(curr_proc->count_physical_pages == MAX_PSYC_PAGES) {
++              // check if the file is also full- so we will need to make a full swap between 2 process
++              if(curr_proc->count_physical_pages + 
++              curr_proc->count_file_pages == MAX_TOTAL_PAGES) {
++                make_full_swap(curr_proc,cr2Val);
++              }
++              //move from physical to files(there is a place there)
++              move_Pyc2File(curr_proc);
++           }
++           //if there is allready room in the physical memory
++           //we only need to take the page from file and put it there 
++          move_File2Pyc(curr_proc,cr2Val);
++          return;
++          }
++      }
++    }
++
++   // break;
++  }
+ 
+   //PAGEBREAK: 13
+   default:
+diff --git a/umalloc.c b/umalloc.c
+old mode 100644
+new mode 100755
+index a7e7d2c..c901153
+--- a/umalloc.c
++++ b/umalloc.c
+@@ -15,17 +15,23 @@ union header {
+   } s;
+   Align x;
+ };
++typedef struct link_header{
++  struct link_header * next;
++  
++}link_list_header;
+ 
+ typedef union header Header;
+-
++static link_list_header *head;
+ static Header base;
+ static Header *freep;
+ 
++
+ void
+ free(void *ap)
+ {
+   Header *bp, *p;
+-
++  if(is_pmalloc(ap))
++    return;
+   bp = (Header*)ap - 1;
+   for(p = freep; !(bp > p && bp < p->s.ptr); p = p->s.ptr)
+     if(p >= p->s.ptr && (bp > p || bp < p->s.ptr))
+@@ -44,12 +50,13 @@ free(void *ap)
+ }
+ 
+ static Header*
+-morecore(uint nu)
++morecore(uint nu, int isPmalloc)
+ {
++  
+   char *p;
+   Header *hp;
+ 
+-  if(nu < 4096)
++  if(nu < 4096 && !isPmalloc)
+     nu = 4096;
+   p = sbrk(nu * sizeof(Header));
+   if(p == (char*)-1)
+@@ -84,7 +91,50 @@ malloc(uint nbytes)
+       return (void*)(p + 1);
+     }
+     if(p == freep)
+-      if((p = morecore(nunits)) == 0)
++      if((p = morecore(nunits,0)) == 0)
+         return 0;
+   }
+ }
++
++
++void*
++pmalloc()
++{
++  void * ans;
++  if(head){
++    ans = (void*)head;
++    head = head->next;
++  }
++  else{
++    ans = sbrk(4096);
++  }
++  Update_Pmalloc(ans);
++  return ans;
++}
++
++int 
++protect_page(void* ap)
++{
++  return protected_page(ap);
++}
++
++int
++pfree(void *ap)
++{
++  if(!is_protected(ap))
++    return -1;
++  link_list_header * new_head;
++  update_unprotected(ap);
++  pmalloc_Off(ap);
++  new_head = (link_list_header*)ap;
++  if(head){
++    new_head->next = head;
++    
++  }else{
++    
++    new_head->next = 0;
++    
++  }
++  head = new_head;
++  return 1;
++}
+diff --git a/user.h b/user.h
+old mode 100644
+new mode 100755
+index 9906db3..45a5f53
+--- a/user.h
++++ b/user.h
+@@ -38,3 +38,12 @@ void* memset(void*, int, uint);
+ void* malloc(uint);
+ void free(void*);
+ int atoi(const char*);
++void* pmalloc();
++int pfree(void*);
++int protect_page(void* ap);
++int protected_page(void* va);
++int is_protected(void *ap);
++int is_pmalloc(void *ap);
++void Update_Pmalloc(void*);
++void update_unprotected(void*);
++void pmalloc_Off(void*);
+\ No newline at end of file
+diff --git a/usys.S b/usys.S
+old mode 100644
+new mode 100755
+index 8bfd8a1..acbfaf7
+--- a/usys.S
++++ b/usys.S
+@@ -29,3 +29,11 @@ SYSCALL(getpid)
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(protected_page)
++SYSCALL(is_protected)
++SYSCALL(Update_Pmalloc)
++SYSCALL(is_pmalloc)
++SYSCALL(update_unprotected)
++SYSCALL(pmalloc_Off)
++
++
+diff --git a/vm.c b/vm.c
+index 3f71b6a..709e978 100644
+--- a/vm.c
++++ b/vm.c
+@@ -9,7 +9,8 @@
+ 
+ extern char data[];  // defined by kernel.ld
+ pde_t *kpgdir;  // for use in scheduler()
+-
++char* insert_to_mem(struct proc* p,pde_t *pgdir,uint va);
++struct page_data findPageToSwap(struct proc* p) ;
+ // Set up CPU's kernel segment descriptors.
+ // Run once on entry on each CPU.
+ void
+@@ -83,7 +84,7 @@ mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
+ // a CPU is not running any process (kpgdir). The kernel uses the
+ // current process's page table during system calls and interrupts;
+ // page protection bits prevent user code from using the kernel's
+-// mappings.
++// mappings
+ //
+ // setupkvm() and exec() set up every page table like this:
+ //
+@@ -177,6 +178,7 @@ switchuvm(struct proc *p)
+   popcli();
+ }
+ 
++
+ // Load the initcode into address 0 of pgdir.
+ // sz must be less than a page.
+ void
+@@ -215,13 +217,11 @@ loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, uint sz)
+   }
+   return 0;
+ }
+-
+ // Allocate page tables and physical memory to grow process from oldsz to
+ // newsz, which need not be page aligned.  Returns new size or 0 on error.
+ int
+ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+ {
+-  char *mem;
+   uint a;
+ 
+   if(newsz >= KERNBASE)
+@@ -229,25 +229,26 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+   if(newsz < oldsz)
+     return oldsz;
+ 
++// In case we are not the Shell / init proc
++  if (myproc() && myproc()->pid > 2) {
++  	#ifndef NONE
++  	// Enter this function when the swapping policy isn't XV6 default
++  	return alloc_pages(pgdir, oldsz, newsz);
++  	#endif	
++  }
++	
+   a = PGROUNDUP(oldsz);
+   for(; a < newsz; a += PGSIZE){
+-    mem = kalloc();
+-    if(mem == 0){
+-      cprintf("allocuvm out of memory\n");
+-      deallocuvm(pgdir, newsz, oldsz);
+-      return 0;
+-    }
+-    memset(mem, 0, PGSIZE);
+-    if(mappages(pgdir, (char*)a, PGSIZE, V2P(mem), PTE_W|PTE_U) < 0){
+-      cprintf("allocuvm out of memory (2)\n");
+-      deallocuvm(pgdir, newsz, oldsz);
+-      kfree(mem);
+-      return 0;
+-    }
++    if(insert_to_mem(myproc(),pgdir,a) == 0) {
++    	deallocuvm(pgdir, newsz, oldsz);
++  		return 0;
++  	}
++    myproc()->count_physical_pages++;
+   }
+   return newsz;
+ }
+ 
++
+ // Deallocate user pages to bring the process size from oldsz to
+ // newsz.  oldsz and newsz need not be page-aligned, nor does newsz
+ // need to be less than oldsz.  oldsz can be larger than the actual
+@@ -255,8 +256,12 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+ int
+ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+ {
+-  pte_t *pte;
++  pte_t* pte;
+   uint a, pa;
++  #ifndef NONE
++    uint va_memory, va_swapFile;
++    struct proc* curproc = myproc();
++  #endif
+ 
+   if(newsz >= oldsz)
+     return oldsz;
+@@ -270,14 +275,27 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+       pa = PTE_ADDR(*pte);
+       if(pa == 0)
+         panic("kfree");
++      #ifndef NONE
++        if(curproc->pgdir == pgdir && curproc->pid > 2){
++          va_memory = PTE_ADDR(a);
++          delete_pyc_page(curproc,va_memory);
++        }
++      #endif
++
+       char *v = P2V(pa);
+       kfree(v);
+       *pte = 0;
++    }else if((*pte & PTE_PG) != 0){
++      #ifndef NONE
++        if(curproc->pgdir == pgdir){
++          va_swapFile = PTE_ADDR(a);
++          delete_file_page(curproc,va_swapFile);
++        }
++      #endif
+     }
+   }
+   return newsz;
+ }
+-
+ // Free a page table and all the physical memory pages
+ // in the user part.
+ void
+@@ -309,7 +327,6 @@ clearpteu(pde_t *pgdir, char *uva)
+     panic("clearpteu");
+   *pte &= ~PTE_U;
+ }
+-
+ // Given a parent process's page table, create a copy
+ // of it for a child.
+ pde_t*
+@@ -325,19 +342,34 @@ copyuvm(pde_t *pgdir, uint sz)
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walkpgdir(pgdir, (void *) i, 0)) == 0)
+       panic("copyuvm: pte should exist");
+-    if(!(*pte & PTE_P))
++    if(!(*pte & PTE_P)&& !(*pte & PTE_PG))
+       panic("copyuvm: page not present");
+     pa = PTE_ADDR(*pte);
+     flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto bad;
++    if(*pte & PTE_P){
++      if((mem = kalloc()) == 0)
++        goto bad;
+     memmove(mem, (char*)P2V(pa), PGSIZE);
+     if(mappages(d, (void*)i, PGSIZE, V2P(mem), flags) < 0)
+       goto bad;
++    }
++    else{
++
++       if((pte = walkpgdir(d, (void*)i, 1)) == 0) 
++          panic("copyuvm: Can't map swapped page\n");
++      
++
++      // The pa isn't relevant here since we will get a page fault
++      // anyways , therfore we only need the flags to indicate that
++      // the page is in the swap file and the va will already map it
++      // to the approptiate location int the swap file. 
++      *pte = 0 | flags;
++    }
+   }
+   return d;
+ 
+ bad:
++  panic("copyuvm:bad");
+   freevm(d);
+   return 0;
+ }
+@@ -383,10 +415,493 @@ copyout(pde_t *pgdir, uint va, void *p, uint len)
+   return 0;
+ }
+ 
+-//PAGEBREAK!
++// PAGEBREAK!
+ // Blank page.
+-//PAGEBREAK!
++// PAGEBREAK!
+ // Blank page.
+-//PAGEBREAK!
++// PAGEBREAK!
+ // Blank page.
+ 
++//***********************************************
++//copy physical pages from one process to another
++void
++copy_pyc_pages(struct proc* proc1,struct proc* proc2)
++{
++ int i;
++  for (i = 0; i < MAX_PSYC_PAGES; i++) {
++    proc2->physical_memory_pages[i].va = proc1->physical_memory_pages[i].va;
++            if(is_pmalloc((void*)proc1->physical_memory_pages[i].va))
++        {
++          Update_Pmalloc((void*)proc2->physical_memory_pages[i].va);
++        }
++  }
++  proc2->count_physical_pages = proc1->count_physical_pages;
++  proc2->FIFO_INDEX = proc1->FIFO_INDEX;
++  proc2->LIFO_INDEX = proc1->LIFO_INDEX;
++  proc2->count_total_swap = 0;
++  proc2->count_pages_faults = 0;
++}
++
++//*****************************************
++// copy file pages from one process to another 
++void
++copy_file_pages(struct proc* proc1,struct proc* proc2)
++{
++  char* buffer = kalloc();
++  int i = 0;
++  int j = 0;
++  for (; i < MAX_PSYC_PAGES; i++) {
++    if(proc1->file_pages[i]!=-1){
++      //put the va in proc2
++      proc2->file_pages[j] = proc1->file_pages[i];
++      //copy the page from proc1 
++      int read_byts = readFromSwapFile(proc1,buffer,PGSIZE * i,PGSIZE);
++      if(read_byts < PGSIZE) {
++        panic("can't read all page\n");
++      }
++      //write to proc2 the page we coppied from proc1
++      int write_bytes = writeToSwapFile(proc2,buffer,PGSIZE * j, PGSIZE);
++      if( write_bytes < 0) {
++        panic("can't write page to file\n");
++      }
++      j++;
++    }
++  }
++  proc2->count_file_pages = proc1->count_file_pages;
++  kfree(buffer);
++  
++  //in the rest of the array of proc2 we need to put -1
++  for (; j < MAX_FILES_PAGES; j++) {
++    proc2->file_pages[j] = -1;
++  }
++}
++//********************************************
++//CR2VALUE= register that has the virtual address
++// This func check if thr page is in the physical address- if so return 1
++int
++pageSwapped(struct proc* proc, uint cr2val)
++{
++  pte_t *pte;
++  pte = walkpgdir(proc->pgdir, (void*)cr2val, 0);
++  if(!pte || !(*pte & PTE_PG))
++    return 0; 
++  return 1;
++}
++
++//***********************************************
++
++//allcate the process pages
++int
++alloc_pages(pde_t *pgdir, uint oldsz, uint newsz)
++{
++  uint a;
++	struct proc* p = myproc();
++	// if we cant allocate more pages
++	if (p->count_file_pages + 
++  p->count_physical_pages >= MAX_TOTAL_PAGES)
++		panic("no room for more pages for this process\n");
++
++ 	a = PGROUNDUP(oldsz);
++  	for(; a < newsz; a += PGSIZE){
++      //if there is no room on the physical memory
++  		if (p->count_physical_pages== MAX_PSYC_PAGES)
++         move_Pyc2File(p);
++
++  		if (insert_to_mem(p,pgdir,a) == 0) {
++        deallocuvm(pgdir, newsz, oldsz);
++  			return 0;
++  		}
++  		p->count_physical_pages++;
++  	}
++  	return newsz;
++}
++
++
++char*
++insert_to_mem(struct proc* p,pde_t *pgdir,uint va){
++    char *mem;
++    mem = kalloc();
++    if(mem == 0){
++      cprintf("allocuvm out of memory\n");
++      return 0;
++    }
++    memset(mem, 0, PGSIZE);
++    if(mappages(pgdir, (char*)va, PGSIZE, V2P(mem), PTE_W|PTE_U) < 0){
++      cprintf("allocuvm out of memory (2)\n");
++      
++      kfree(mem);
++      return 0;
++    }
++    #ifndef NONE
++    int i=0;
++    for(; i < MAX_PSYC_PAGES; i++) {
++      //find an empty place
++      if(p->physical_memory_pages[i].va == -1){
++        p->physical_memory_pages[i].va = (int) PTE_ADDR(va);
++    goto found;
++      }
++    }
++    found:
++    #endif
++    return mem;
++
++}
++//********************************************
++//if there is no room in both of the arrays- 
++//we need to switch between 2
++void
++make_full_swap(struct proc* proc, uint cr2Val)
++{
++  char* temp_data_page;
++
++  //just for now choose the firt one
++  uint memory_va = findPageToSwap(proc).va;
++  //make a room in the physical memory:
++  int i=0;
++   for(; i < MAX_PSYC_PAGES; i++) {
++    if(proc->physical_memory_pages[i].va == memory_va) {
++      proc->physical_memory_pages[i].va = -1;
++      goto found_memory;
++    }
++  }
++  panic("Page not found in the physical memory\n");
++  
++  found_memory:
++  //now we are going to save in a temp place in the memory 
++  //the page that we take out from the physical memory
++  temp_data_page = kalloc();
++  pte_t* pte = walkpgdir(proc->pgdir, (void*)memory_va, 0);
++  memmove((void*)temp_data_page,(void*)PTE_ADDR(pte),PGSIZE);
++ 
++  //change the flag to zero
++  *pte = (*pte) & ~PTE_P;
++
++  //move down the counter of the physical memory
++  proc->count_physical_pages--;
++
++ //move the page from the file to the physical memory:
++ //there is a room there because we just move out one page
++ // 15 = array_memory 16 = array_files
++  move_File2Pyc(proc,cr2Val);
++ // 16= array_memory 15 = array_files
++
++  //after we move the physical memory is full again
++  //in the file there is a place- we need to add the temp file to there
++  //find the empty place in the file
++  for (i = 0; i < MAX_FILES_PAGES; i++) {
++    if(proc->file_pages[i] == -1) {
++      proc->file_pages[i] = memory_va;
++      goto found_file;
++    }
++  }
++
++ //if there is no room in the file
++  panic("can't find space in the file\n");
++   
++  found_file:
++  // writing the page into the file
++  writeToSwapFile(proc,(char*) temp_data_page, i*PGSIZE, PGSIZE);
++  //change the flag to 1
++  *pte = (*pte) | PTE_PG;
++  // free the memory that we allocate 
++  kfree(temp_data_page);
++  proc->count_file_pages++;
++  //array files = 16
++  lcr3(V2P(proc->pgdir));
++}
++//********************************************
++//move page from file to physical memory
++void 
++move_File2Pyc(struct proc* proc, uint cr2Val){
++
++  uint va=PTE_ADDR(cr2Val);
++  char* memory_alloc;
++  //seach for index in the files tbl + delete this page if exist
++  int i = 0;
++  
++  for(;i<MAX_FILES_PAGES ;i++){
++    if(proc->file_pages[i] == va){
++      proc->file_pages[i]=-1;
++      goto found;
++    }
++  }
++  //if the page is not in the file
++  panic("Page not found in the file\n");
++  
++  //else- allocate new place for the page
++  found:
++  memory_alloc = insert_to_mem(proc,proc->pgdir, va);
++  if(memory_alloc == 0)
++    panic("allocate fail!\n");
++  
++  int read_bits=readFromSwapFile(proc, memory_alloc,i*PGSIZE ,PGSIZE);
++  if(read_bits !=PGSIZE )
++    panic("we didn't read the all page\n");
++  
++  //we have one more page in the physical memory
++  proc->count_physical_pages++;
++  //we have one page less in the file
++  proc->count_file_pages--;   
++
++  //get the physical address for this page
++  pte_t * pyc_add = walkpgdir (proc->pgdir ,(void*) va ,0);
++
++  //change the flag that say that the page is in the files to zero in the physical address.
++  *pyc_add = *pyc_add & ~PTE_PG;
++  lcr3(V2P (proc->pgdir));
++}
++
++void 
++move_Pyc2File(struct proc* proc){
++  int write_bits;
++  //for now we need to take the first one-
++  // later we will change it  
++  uint va =findPageToSwap(proc).va;
++  int i = 0;
++  for(;i<MAX_FILES_PAGES ;i++){
++    if(proc->file_pages[i] == -1){
++      proc->file_pages[i] = va;
++      goto found;
++    }
++  }
++  //if there is no room in the file
++  panic("can't find space in the file\n");
++  
++  //else- allocate new place for the page
++  found:
++  write_bits=writeToSwapFile(proc, (char*)va, i*PGSIZE ,PGSIZE);
++  if(write_bits != PGSIZE )
++    panic("we didn't write the all page to the file\n");
++  
++  //we have one less page in the physical memory
++  proc->count_physical_pages--;
++
++  //we have one more page in the file
++  proc->count_file_pages++;   
++
++  proc->count_total_swap++;
++
++  for(i = 0; i < MAX_PSYC_PAGES; i++) {
++    if(proc->physical_memory_pages[i].va == va) {
++      proc->physical_memory_pages[i].va = -1;
++      break;
++    }
++  }
++    if(i == MAX_PSYC_PAGES) {
++    panic("swapOutPage: Can't find the va in physical_memory_pages structure\n");
++  }
++  //get the physical address for this page
++  pte_t * pyc_add = walkpgdir (proc->pgdir ,(void*) va ,0);
++
++
++  //change the flag that say that the page is in the files to one in the physical address.
++  *pyc_add = *pyc_add | PTE_PG;
++  //change the flag that say that the page is in the physical memory to zero in the physical address.
++  *pyc_add = *pyc_add & ~PTE_P;
++
++  kfree((char*)PTE_ADDR (P2V (*pyc_add)));
++  lcr3(V2P (proc->pgdir));
++}
++
++//********************************
++void
++free_file_pages(struct proc* proc)
++{
++   int i= 0;
++    for (; i < MAX_FILES_PAGES; i++) {
++      proc->file_pages[i] = -1;
++    }
++    proc->count_file_pages = 0;
++
++  //remove swap file
++  if (removeSwapFile(proc) < 0) {
++    panic("can't remove swap file\n");
++  }
++}
++
++//***********************************************
++void
++free_pyc_pages(struct proc* proc)
++{
++  int i= 0;
++    for (; i < MAX_PSYC_PAGES; i++) {
++      proc->physical_memory_pages[i].va = -1;
++    }
++    proc->count_physical_pages = 0;
++    proc->FIFO_INDEX = 0;
++    proc->LIFO_INDEX = 15;
++}
++
++//***********************************************
++
++void delete_file_page(struct proc* p, uint va) {
++   #ifdef NONE
++    return;
++  #endif
++  int i=0;
++  pte_t* pte;
++  for (; i < MAX_FILES_PAGES; i++) {
++    if (p->file_pages[i] == va) {
++      p->file_pages[i] = -1;
++      goto found;
++    }
++  }
++  panic("can't find the page\n");
++  found:
++   pte = walkpgdir(p->pgdir, (void*)va ,0);
++  if(pte) {
++    *pte = *pte & ~PTE_PG;
++  }
++  p->count_file_pages--;
++}
++//*****************************************
++void
++delete_pyc_page(struct proc* curproc, uint va){
++   #ifdef NONE
++    return;
++  #endif
++  pte_t* pte_memory;
++  int i;
++  if((pte_memory = walkpgdir(curproc->pgdir, (void *) va, 0)) != 0)
++    *pte_memory &= ~PTE_P;  // clear present flag
++  for(i = 0; i < MAX_PSYC_PAGES; i++)
++    if(curproc->physical_memory_pages[i].va == va)
++      curproc->physical_memory_pages[i].va = -1;
++  curproc->count_physical_pages--;
++}
++
++//*****************************************
++
++
++
++int checkUserPage(pde_t* pgdir, void* va) {
++  pte_t* pte = walkpgdir(pgdir, va, 0);
++    if((*pte & PTE_U) == 0) {
++      return 0;
++    }
++    return 1;
++}
++
++//*****************************************
++
++int isAccessFlagOn(struct proc* p, uint va) {
++  pte_t* pte;
++  int pte_a;
++  pte = walkpgdir(p->pgdir,(void*)va, 0);
++  pte_a = PTE_FLAGS(*pte) & PTE_A;
++  *pte = *pte & ~PTE_A;
++  return pte_a;
++}
++//*****************************************
++
++struct page_data SCFIFO_ALG(struct proc* p) {
++    int toSwapIndex = -1;
++    //a number between 0-15
++    int i = (p->FIFO_INDEX) % MAX_PSYC_PAGES;
++    
++    while (1) {
++
++      if (checkUserPage(p->pgdir,(void*) p->physical_memory_pages[i].va)) {
++
++        if (isAccessFlagOn(p, p->physical_memory_pages[i].va) == 0) {
++          toSwapIndex = i;
++            cprintf("indexToSwap: %d\n", toSwapIndex);
++
++          break;
++        }
++      }
++      //moving to the next page becuse the bit of this one is on
++      i = (i + 1) % MAX_PSYC_PAGES;  
++    }
++    //found the page we want to get out
++    //the next time we will strat with the next page
++    p->FIFO_INDEX = (i + 1) % MAX_PSYC_PAGES;
++    return p->physical_memory_pages[toSwapIndex];
++}
++
++//*****************************************
++
++struct page_data
++LIFO_ALG(struct proc* p)
++{ 
++  int indexToSwap = -1;
++  if(p->LIFO_INDEX < 0)
++    indexToSwap = ((p->LIFO_INDEX) % MAX_PSYC_PAGES)+16;
++  else
++    indexToSwap = (p->LIFO_INDEX) % MAX_PSYC_PAGES;
++
++  cprintf("indexToSwap: %d\n", indexToSwap);
++  indexToSwap--;
++  p->LIFO_INDEX = indexToSwap % MAX_PSYC_PAGES;
++  indexToSwap++;
++  return p->physical_memory_pages[indexToSwap];
++}
++//*****************************************
++
++struct page_data
++findPageToSwap(struct proc* p) {
++  cprintf("swaping \n");
++  #ifdef SCFIFO
++  return SCFIFO_ALG(p);
++  #elif LIFO
++  return LIFO_ALG(p);
++  #endif
++  return p->physical_memory_pages[0];
++}
++
++void
++Update_Pmalloc(void * va){
++  pte_t* pte;
++  pte = walkpgdir(myproc()->pgdir,(void*)va, 0);
++  *pte = *pte | PTE_PMAL;
++}
++
++int
++is_pmalloc(void* va){
++  pte_t* pte;
++  pte = walkpgdir(myproc()->pgdir,(void*)va, 0);
++  if(*pte & PTE_PMAL){
++    return 1;
++  }
++
++ return 0;
++}
++
++
++int protected_page(void* va) 
++{
++  pte_t* pte = walkpgdir(myproc()->pgdir,va,0);
++  if((*pte & PTE_PMAL) && !((uint)va & 0xFFF))
++  {
++    *pte = *pte & ~PTE_W;
++    myproc()->count_protected_pages++;
++    return 1;
++  }
++  return -1;
++}
++
++int
++is_protected(void* va){
++  pte_t* pte;
++  pte = walkpgdir(myproc()->pgdir,(void*)va, 0);
++  if(*pte & PTE_W){
++    return 0;
++  }
++
++ return 1;
++}
++
++void
++update_unprotected(void* va){
++  pte_t* pte;
++  pte = walkpgdir(myproc()->pgdir,(void*)va, 0);
++  *pte = *pte | PTE_W;
++}
++
++void 
++pmalloc_Off(void *va){
++    myproc()->count_protected_pages--;
++    pte_t* pte;
++  pte = walkpgdir(myproc()->pgdir,(void*)va, 0);
++  *pte = *pte & ~PTE_PMAL;
++}
+\ No newline at end of file

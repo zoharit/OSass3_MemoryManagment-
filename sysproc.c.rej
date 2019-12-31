@@ -1,0 +1,48 @@
+diff a/sysproc.c b/sysproc.c	(rejected hunks)
+@@ -96,3 +96,45 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++int sys_protected_page(void){
++  void* va;
++  if(argptr(0, (void*)&va,4) < 0)
++    return -1;
++  return protected_page(va);
++}
++
++int sys_is_protected(void){
++  void* va;
++  if(argptr(0, (void*)&va,4) < 0)
++    return -1;
++  return is_protected(va);
++}
++int sys_is_pmalloc(void){
++  void* va;
++  if(argptr(0, (void*)&va,4) < 0)
++    return -1;
++  return is_pmalloc(va);
++}
++int sys_update_unprotected(void){
++  void* va;
++  if(argptr(0, (void*)&va,4) < 0)
++    return -1;
++   update_unprotected(va);
++   return 1;
++}
++int sys_pmalloc_Off(void){
++   void* va;
++  if(argptr(0, (void*)&va,4) < 0)
++    return -1;
++  pmalloc_Off(va);
++return 1;
++}
++
++
++int sys_Update_Pmalloc(void){
++  void* va;
++  if(argptr(0, (void*)&va,4) < 0)
++    return -1;
++   Update_Pmalloc(va);
++   return 1;
++}
+\ No newline at end of file

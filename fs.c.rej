@@ -1,0 +1,9 @@
+diff a/fs.c b/fs.c	(rejected hunks)
+@@ -801,6 +801,7 @@ writeToSwapFile(struct proc * p, char* buffer, uint placeOnFile, uint size)
+ }
+ 
+ //return as sys_read (-1 when error)
++// chamge the offset to be the place in the files tbl
+ int
+ readFromSwapFile(struct proc * p, char* buffer, uint placeOnFile, uint size)
+ {

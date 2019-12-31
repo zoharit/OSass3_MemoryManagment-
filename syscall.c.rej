@@ -1,0 +1,31 @@
+diff a/syscall.c b/syscall.c	(rejected hunks)
+@@ -104,6 +104,13 @@ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
+ extern int sys_yield(void);
++extern int sys_protected_page(void);
++extern int sys_is_protected(void);
++extern int sys_Update_Pmalloc(void);
++extern int sys_is_pmalloc(void);
++extern int sys_update_unprotected(void);
++extern int sys_pmalloc_Off(void);
++
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -128,8 +135,15 @@ static int (*syscalls[])(void) = {
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
+ [SYS_yield]   sys_yield,
++[SYS_protected_page]   sys_protected_page,
++[SYS_is_protected]   sys_is_protected,
++[SYS_Update_Pmalloc] sys_Update_Pmalloc,
++[SYS_is_pmalloc]   sys_is_pmalloc,
++[SYS_update_unprotected]   sys_update_unprotected,
++[SYS_pmalloc_Off]   sys_pmalloc_Off,
+ };
+ 
++
+ void
+ syscall(void)
+ {
